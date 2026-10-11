@@ -12,13 +12,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 
-from PyQt5.QtCore import QPointF, QRectF, QSettings, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PyQt5.QtCore import QPointF, QRectF, QRegularExpression, QSettings, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegularExpressionValidator
 from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
                              QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QScrollArea,
                              QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
+import compressors
 import converters as cv
 
 APP_NAME = "DocShift"
@@ -131,6 +132,7 @@ QLabel#DropSub { color: $muted; }
 QLabel#ListHeader { font-weight: 600; }
 QLabel#EmptyState { color: $muted; }
 QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }
+QWidget#SideList { background: transparent; }
 
 QFrame#FileRow { background: $card; border: 1px solid $border; border-radius: 12px; }
 QFrame#FileRow QLabel { background: transparent; }
@@ -233,10 +235,10 @@ def build_qss(p: dict, tag: str) -> str:
 # --------------------------------------------------------------------------- #
 KIND_STYLE = {
     "word": ("W", "#2B579A"), "excel": ("X", "#1D7A46"), "ppt": ("P", "#C8431F"),
-    "img": ("IMG", "#8B5CF6"), "pdf": ("PDF", "#E5484D"),
+    "img": ("IMG", "#8B5CF6"), "pdf": ("PDF", "#E5484D"), "video": ("VID", "#0891B2"),
 }
 KIND_NOUN = {"word": "Word documents", "excel": "Excel workbooks", "ppt": "PowerPoint presentations",
-             "img": "images", "pdf": "PDF files"}
+             "img": "images", "pdf": "PDF files", "video": "videos"}
 
 
 def badge_pixmap(kind: str, size: int = 32) -> QPixmap:
@@ -370,11 +372,11 @@ class ModeItem(QFrame):
         self.setFocusPolicy(Qt.TabFocus)  # ring only when reached by keyboard, never after a mouse click
         self.setProperty("active", False)
         row = QHBoxLayout(self)
-        row.setContentsMargins(10, 8, 10, 8)
+        row.setContentsMargins(10, 6, 10, 6)
         row.setSpacing(10)
         badges = QHBoxLayout()
         badges.setSpacing(3)
-        for kind in (mode.src, None, mode.dst):
+        for kind in ((mode.src, None, mode.dst) if mode.dst else (mode.src,)):
             lbl = QLabel()
             if kind:
                 lbl.setPixmap(badge_pixmap(kind, 24))
@@ -502,10 +504,23 @@ class Opt:
     choices: list = field(default_factory=list)   # [(label, value)]
     default: object = None
     placeholder: str = ""
+    when: tuple | None = None         # (other_key, value): only shown while that option has that value
+    numeric: bool = False             # text box accepts a number like 2 or 0.5
+    off_if_filled: str = ""           # disabled while the text box with this key has something typed in it
 
 
 QUALITY = [("High quality (print)", "print"), ("Smaller file (screen)", "screen")]
-OPTIONS: dict[str, tuple[list[Opt], str]] = {
+LEVELS = [("Light (best quality)", "light"), ("Balanced", "balanced"), ("Strong (smallest)", "strong")]
+SQUEEZE_COMMON = [
+    Opt("combo", "action", "Action", [("Compress", "compress"), ("Decompress", "expand")]),
+    Opt("combo", "level", "Level", LEVELS, default="balanced", when=("action", "compress"), off_if_filled="target_mb"),
+]
+TARGET = Opt("text", "target_mb", "Target size in MB (optional)", placeholder="No limit", numeric=True,
+             when=("action", "compress"))
+TARGET_HINT = ("Leave the size empty to use the level, or type a limit (for example 2) and DocShift keeps the best "
+               "quality that fits under it. 1 MB = 1,000,000 bytes, so the result passes upload checks that count "
+               "either way.")
+OPTIONS: dict[str, tuple[list[Opt], object]] = {
     "word2pdf": ([Opt("combo", "quality", "Quality", QUALITY),
                   Opt("check", "bookmarks", "Create bookmarks from headings", default=True)],
                  "Uses Word's own PDF export, so pagination, fonts, headers, footers and images match."),
@@ -534,33 +549,56 @@ OPTIONS: dict[str, tuple[list[Opt], str]] = {
                                                     ("300 dpi (print)", 300), ("600 dpi", 600)], default=200),
                  Opt("text", "pages", "Pages", placeholder="All pages - or e.g. 1-3, 5")],
                 "Multi-page PDFs are saved into a new folder, one image per page."),
+    "compress_pdf": ([*SQUEEZE_COMMON, TARGET],
+                     {"compress": TARGET_HINT + " If images alone can't get there, pages are flattened to pictures.",
+                      "expand": "Rewrites the PDF with every stream uncompressed. Bigger, but easy to inspect or edit. "
+                                "It can't restore quality lost in an earlier compression."}),
+    "compress_img": ([*SQUEEZE_COMMON,
+                      Opt("combo", "format", "Save as", [("Same format", "same"), ("JPG", "jpg"), ("WEBP", "webp"),
+                                                         ("PNG", "png")], when=("action", "compress")),
+                      Opt("combo", "expand_format", "Save as", [("PNG (lossless)", "png"), ("TIFF (uncompressed)", "tiff"),
+                                                                ("BMP (uncompressed)", "bmp")],
+                          when=("action", "expand")),
+                      TARGET],
+                     {"compress": TARGET_HINT + " The picture is only shrunk if a good quality can't fit.",
+                      "expand": "Saves the image in a lossless or uncompressed format. Detail lost to earlier "
+                                "compression can't be recovered."}),
+    "compress_video": ([*SQUEEZE_COMMON, TARGET],
+                       {"compress": TARGET_HINT + " Longer videos or smaller limits lower the resolution. The result "
+                                                  "is an MP4 (H.264).",
+                        "expand": "Saves the video losslessly (FFV1 in an MKV). Expect a file many times larger; "
+                                  "quality is not improved."}),
 }
 
 
 class OptionsPanel(QWidget):
     """Builds the controls for one mode and reads their values back."""
+    changed = pyqtSignal()
 
     def __init__(self, mode_key: str):
         super().__init__()
-        specs, hint = OPTIONS[mode_key]
+        specs, self._hints = OPTIONS[mode_key]
         self.widgets: dict[str, QWidget] = {}
+        self.boxes: dict[str, QWidget] = {}
         self.specs = {o.key: o for o in specs}
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(10)
-        col = 0
+        row = QHBoxLayout()
+        row.setSpacing(16)
         for o in specs:
+            box = QWidget()
+            bl = QVBoxLayout(box)
+            bl.setContentsMargins(0, 0, 0, 0)
+            bl.setSpacing(4)
             if o.kind == "check":
                 w = QCheckBox(o.label)
                 w.setChecked(bool(o.default))
                 w.setCursor(Qt.PointingHandCursor)
-                grid.addWidget(w, 0, col, 1, 1, Qt.AlignBottom)
+                w.toggled.connect(self._on_change)
+                bl.addStretch(1)
+                bl.addWidget(w)
             else:
-                box = QVBoxLayout()
-                box.setSpacing(4)
                 lbl = QLabel(o.label)
                 lbl.setObjectName("FieldLabel")
                 if o.kind == "combo":
@@ -569,28 +607,52 @@ class OptionsPanel(QWidget):
                         w.addItem(text, value)
                     if o.default is not None:
                         w.setCurrentIndex(max(0, w.findData(o.default)))
-                    w.setMinimumWidth(190)
+                    w.setMinimumWidth(150)
+                    w.currentIndexChanged.connect(self._on_change)
                 else:
                     w = QLineEdit()
                     w.setPlaceholderText(o.placeholder)
-                    w.setMinimumWidth(220)
-                box.addWidget(lbl)
-                box.addWidget(w)
-                grid.addLayout(box, 0, col)
+                    w.setMinimumWidth(150 if o.numeric else 220)
+                    if o.numeric:
+                        w.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,5}([.,]\d{0,3})?"), w))
+                    w.textChanged.connect(self._on_change)
+                bl.addWidget(lbl)
+                bl.addWidget(w)
             self.widgets[o.key] = w
-            col += 1
-        grid.setColumnStretch(col, 1)
+            self.boxes[o.key] = box
+            row.addWidget(box)
+        row.addStretch(1)
         if specs:
-            lay.addLayout(grid)
-        self.hint = QLabel(hint)
+            lay.addLayout(row)
+        self.hint = QLabel()
         self.hint.setObjectName("Hint")
         self.hint.setWordWrap(True)
         lay.addWidget(self.hint)
+        self._sync()
         if mode_key == "img2pdf":  # margin only matters for fixed page sizes
             page, margin = self.widgets["page"], self.widgets["margin"]
             sync = lambda: margin.setEnabled(page.currentData() != "fit")
             page.currentIndexChanged.connect(sync)
             sync()
+
+    def _on_change(self, *_):
+        self._sync()
+        self.changed.emit()
+
+    def _sync(self):
+        """Show only the options that apply to the chosen action; grey out Level while a size limit is typed."""
+        vals = self.values()
+        for key, o in self.specs.items():
+            if o.when:
+                self.boxes[key].setVisible(vals.get(o.when[0]) == o.when[1])
+            if o.off_if_filled:
+                filled = bool(vals.get(o.off_if_filled))
+                self.widgets[key].setEnabled(not filled)
+                self.widgets[key].setToolTip("Not used while a target size is set." if filled else "")
+        hint = self._hints
+        if isinstance(hint, dict):
+            hint = hint.get(vals.get("action"), "")
+        self.hint.setText(hint)
 
     def values(self) -> dict:
         out = {}
@@ -611,6 +673,7 @@ class Worker(QThread):
     task_started = pyqtSignal(list)
     task_done = pyqtSignal(list, object)
     task_failed = pyqtSignal(list, str)
+    task_progress = pyqtSignal(float)
     all_done = pyqtSignal()
 
     def __init__(self, mode: str, tasks: list, out_dir: Path, opts: dict):
@@ -627,7 +690,8 @@ class Worker(QThread):
                     break
                 self.task_started.emit(ids)
                 try:
-                    res = cv.run(self.mode, paths, self.out_dir, self.opts, office)
+                    ctl = cv.Control(self.task_progress.emit, lambda: self.cancelled)
+                    res = cv.run(self.mode, paths, self.out_dir, self.opts, office, ctl)
                 except Exception as e:  # noqa: BLE001 - every failure is reported per file
                     self.task_failed.emit(ids, cv.friendly_error(e))
                 else:
@@ -661,6 +725,7 @@ class MainWindow(QWidget):
         self._running_tasks = 0
         self._results: list[tuple[str, object]] = []
         self._focused_once = False
+        self._real_progress = False
         self.engines = cv.engine_status()
         self.last_dir = str(Path.home() / "Documents")
         self._build()
@@ -701,22 +766,32 @@ class MainWindow(QWidget):
         brand.addWidget(logo)
         brand.addLayout(names, 1)
         lay.addLayout(brand)
-        lay.addSpacing(18)
+        lay.addSpacing(8)
 
         self.mode_items: dict[str, ModeItem] = {}
-        for title, group in (("CONVERT TO PDF", [m for m in cv.MODES if m.dst == "pdf"]),
-                             ("CONVERT FROM PDF", [m for m in cv.MODES if m.src == "pdf"])):
+        scroll = QScrollArea()  # only scrolls on short screens; otherwise every mode is visible at once
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        holder = QWidget()
+        holder.setObjectName("SideList")
+        hl = QVBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 6, 0)
+        hl.setSpacing(2)
+        for title, key in (("CONVERT TO PDF", "to"), ("CONVERT FROM PDF", "from"), ("COMPRESS & DECOMPRESS", "squeeze")):
             lbl = QLabel(title)
             lbl.setObjectName("SectionLabel")
-            lay.addSpacing(6)
-            lay.addWidget(lbl)
-            lay.addSpacing(2)
-            for m in group:
+            hl.addSpacing(8)
+            hl.addWidget(lbl)
+            hl.addSpacing(2)
+            for m in (m for m in cv.MODES if m.group == key):
                 item = ModeItem(m)
                 item.clicked.connect(self.set_mode)
                 self.mode_items[m.key] = item
-                lay.addWidget(item)
-        lay.addStretch(1)
+                hl.addWidget(item)
+        hl.addStretch(1)
+        scroll.setWidget(holder)
+        lay.addWidget(scroll, 1)
 
         st = self.engines
         if all(st["office"].values()):
@@ -834,6 +909,7 @@ class MainWindow(QWidget):
         self.panels: dict[str, OptionsPanel] = {}
         for m in cv.MODES:
             panel = OptionsPanel(m.key)
+            panel.changed.connect(self._options_changed)
             self.panels[m.key] = panel
             self.opt_stack.addWidget(panel)
         oc.addWidget(self.opt_stack)
@@ -929,12 +1005,13 @@ class MainWindow(QWidget):
         m = self.mode
         for k, item in self.mode_items.items():
             item.set_active(k == key)
-        self.title.setText(m.title)
         self.blurb.setText(m.blurb)
         self.opt_stack.setCurrentWidget(self.panels[key])
+        self._update_title()
         noun = KIND_NOUN[m.src]
         self.drop_title.setText(f"Drop {noun} here")
-        exts = ", ".join(e.lstrip(".").upper() for e in cv.KIND_EXTS[m.src] if e not in (".jfif", ".ico", ".dot", ".dotx"))
+        shown = [e.lstrip(".").upper() for e in cv.KIND_EXTS[m.src] if e not in (".jfif", ".ico", ".dot", ".dotx")]
+        exts = ", ".join(shown[:7]) + (" & more" if len(shown) > 7 else "")
         self.drop_sub.setText(f"or click Browse to choose them  ·  {exts}")
         stale = [r for r in self.rows if r.kind != m.src]
         for r in stale:
@@ -948,8 +1025,32 @@ class MainWindow(QWidget):
         else:
             self.set_status("Add files to get started." if not self.rows else f"{len(self.rows)} file(s) ready.")
 
+    def _action(self) -> str:
+        return self.panels[self.mode_key].values().get("action", "convert")
+
+    def _update_title(self):
+        title = self.mode.title
+        if self._action() == "expand":
+            title = title.replace("Compress", "Decompress")
+        self.title.setText(title)
+        pending = sum(1 for r in self.rows if r.state in ("queued", "error"))
+        verb = {"compress": "Compress", "expand": "Decompress"}.get(self._action(), "Convert")
+        self.go_btn.setText(f"{verb} && Save {pending} files" if pending > 1 else f"{verb} && Save")
+
+    def _options_changed(self):
+        """New settings mean the earlier results no longer apply - let finished files be run again."""
+        if self.worker:
+            return
+        for r in self.rows:
+            if r.state == "done":
+                r.set_state("queued")
+        self._refresh_list()
+        self._update_title()
+
     def _engine_problem(self, key: str) -> str | None:
         st = self.engines
+        if key == "compress_video" and not st.get("ffmpeg"):
+            return "The video engine (ffmpeg) wasn't found, so video compression isn't available."
         kind = {"word2pdf": "word", "excel2pdf": "excel", "ppt2pdf": "ppt", "pdf2word": "word"}.get(key)
         if kind is None or st["office"][kind]:
             return None
@@ -1011,7 +1112,7 @@ class MainWindow(QWidget):
                                 f"Clear the list or pick another conversion.", "warn")
                 return
             target = {"word": "word2pdf", "excel": "excel2pdf", "ppt": "ppt2pdf", "img": "img2pdf",
-                      "pdf": "pdf2word"}[first]
+                      "pdf": "pdf2word", "video": "compress_video"}[first]
             self.set_mode(target)
             want = first
         keep = [f for f, k in zip(files, kinds) if k == want]
@@ -1078,7 +1179,8 @@ class MainWindow(QWidget):
         self.drop.setFixedHeight(84 if n else 104)  # compact once files are listed, leaving more room for them
         pending = sum(1 for r in self.rows if r.state in ("queued", "error"))
         self.go_btn.setEnabled(pending > 0 and not self.worker)
-        self.go_btn.setText(f"Convert && Save {pending} files" if pending > 1 else "Convert && Save")
+        if hasattr(self, "title"):
+            self._update_title()
 
     def set_status(self, text: str, state: str = ""):
         self.status_line.setText(text)
@@ -1126,6 +1228,16 @@ class MainWindow(QWidget):
             except cv.ConversionError as e:
                 QMessageBox.warning(self, APP_NAME, str(e))
                 return
+        if self.mode_key.startswith("compress_"):
+            try:  # fail fast on a typo like "2mb" instead of after the first file
+                compressors.parse_target(opts.get("target_mb") if opts.get("action") == "compress" else "")
+            except cv.ConversionError as e:
+                QMessageBox.warning(self, APP_NAME, str(e))
+                return
+            if opts.get("action") == "expand" and self.mode_key == "compress_video" and QMessageBox.question(
+                    self, APP_NAME, "Decompressed (lossless) video is often 10-50 times larger than the original "
+                                    "and can fill your disk quickly.\n\nContinue?") != QMessageBox.Yes:
+                return
         if self.mode_key == "img2pdf" and opts.get("merge") and len(pending) > 1:
             tasks = [([r.uid for r in pending], [r.path for r in pending])]
         else:
@@ -1138,9 +1250,10 @@ class MainWindow(QWidget):
         self.worker.task_started.connect(self._on_started)
         self.worker.task_done.connect(self._on_done)
         self.worker.task_failed.connect(self._on_failed)
+        self.worker.task_progress.connect(self._on_progress)
         self.worker.all_done.connect(self._on_all_done)
         self._set_running(True)
-        self.set_status(f"Converting… 0 of {len(tasks)}")
+        self.set_status(f"{self._verb()}… 0 of {len(tasks)}")
         self.worker.start()
         self.tick.start(80)
 
@@ -1161,22 +1274,33 @@ class MainWindow(QWidget):
         if self.worker:
             self.worker.cancelled = True
             self.cancel_btn.setEnabled(False)
-            self.set_status("Cancelling after the current file…", "warn")
+            self.set_status("Cancelling…", "warn")
+
+    def _verb(self) -> str:
+        return {"compress": "Compressing", "expand": "Decompressing"}.get(self._action(), "Converting")
 
     def _row(self, uid: int) -> FileRow | None:
         return next((r for r in self.rows if r.uid == uid), None)
 
+    def _on_progress(self, fraction: float):
+        if fraction > 0:  # real progress from the engine takes over from the eased estimate
+            self._real_progress = True
+            self._task_frac = max(self._task_frac, min(fraction, 1.0))
+            self._update_bar()
+
     def _on_started(self, ids: list):
         self._task_frac = 0.0
+        self._real_progress = False
         for uid in ids:
             r = self._row(uid)
             if r:
-                r.set_state("running")
-        self.set_status(f"Converting… {self._tasks_done + 1} of {self._tasks_total}")
+                r.set_state("running", f"{self._verb()}…")
+        self.set_status(f"{self._verb()}… {self._tasks_done + 1} of {self._tasks_total}")
 
     def _on_done(self, ids: list, res: cv.Result):
         self._tasks_done += 1
         self._task_frac = 0.0
+        self._real_progress = False
         show = res.reveal
         for uid in ids:
             r = self._row(uid)
@@ -1184,13 +1308,24 @@ class MainWindow(QWidget):
                 label = "Saved" + (f" · {res.outputs[0].name}" if len(ids) == 1 and res.outputs else "")
                 if len(ids) > 1:
                     label = f"Merged into {res.outputs[0].name}"
-                r.set_state("done", label, tip=(res.note + "\n" if res.note else "") + str(show), reveal_path=show)
+                if res.detail:
+                    label = res.detail  # e.g. "12.40 MB -> 1.98 MB (-84%)"
+                tip = "\n".join(x for x in (res.outputs[0].name, res.note, str(show)) if x)
+                r.set_state("done", label, tip=tip, reveal_path=show)
         self._results.append(("ok", res))
         self._update_bar()
 
     def _on_failed(self, ids: list, message: str):
         self._tasks_done += 1
         self._task_frac = 0.0
+        self._real_progress = False
+        if message == "Cancelled":  # stopped by the user, not a failure
+            for uid in ids:
+                r = self._row(uid)
+                if r:
+                    r.set_state("queued")
+            self._update_bar()
+            return
         for uid in ids:
             r = self._row(uid)
             if r:
@@ -1199,7 +1334,7 @@ class MainWindow(QWidget):
         self._update_bar()
 
     def _on_tick(self):
-        if self.worker and self._tasks_done < self._tasks_total:
+        if self.worker and self._tasks_done < self._tasks_total and not self._real_progress:
             self._task_frac += (0.92 - self._task_frac) * 0.035  # eases toward 92% while a file is being converted
             self._update_bar()
 
@@ -1262,24 +1397,36 @@ def selftest(outdir: Path) -> int:
     (src / "sample.rtf").write_text(r"{\rtf1\ansi \b DocShift\b0  self-test paragraph.\par Second line.}",
                                     encoding="ascii")
     (src / "sample.csv").write_text("a,b,c\n1,2,3\n4,5,6\n7,8,9\n", encoding="ascii")
+    ff = cv.ffmpeg_path()
+    if ff:  # a 2-second test clip, made with the same bundled ffmpeg the app uses
+        import subprocess
+        subprocess.run([ff, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24",
+                        "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2", "-pix_fmt", "yuv420p",
+                        str(src / "sample.mp4")], stdin=subprocess.DEVNULL,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     cv.com_init()
     office = cv.OfficeSession()
     steps = [("img2pdf", src / "sample.png", {"page": "fit"}), ("word2pdf", src / "sample.rtf", {}),
              ("excel2pdf", src / "sample.csv", {"fit_width": True})]
     made: dict[str, Path] = {}
+    squeeze = {"action": "compress", "target_mb": "0.05"}
     try:
         for mode, path, opts in steps + [("pdf2img", None, {"format": "webp", "dpi": 72}),
                                          ("pdf2excel", None, {}), ("pdf2ppt", None, {"style": "editable"}),
-                                         ("pdf2word", None, {})]:
+                                         ("pdf2word", None, {}),
+                                         ("compress_img", src / "sample.png", {**squeeze, "target_mb": "0.01"}),
+                                         ("compress_pdf", None, {**squeeze, "target_mb": ""}),
+                                         ("compress_video", src / "sample.mp4", {**squeeze, "target_mb": "0.1"}),
+                                         ("compress_video", src / "sample.mp4", {"action": "expand"})]:
             try:
                 if path is None:
                     path = made["word2pdf"]
                 res = cv.run(mode, [path], outdir, opts, office)
                 made[mode] = res.outputs[0]
-                log.append(f"OK    {mode:10} -> {res.outputs[0].name}")
+                log.append(f"OK    {mode:14} -> {res.outputs[0].name}")
             except Exception as e:  # noqa: BLE001
                 ok_all = False
-                log.append(f"FAIL  {mode:10} -> {cv.friendly_error(e)}")
+                log.append(f"FAIL  {mode:14} -> {cv.friendly_error(e)}")
     finally:
         office.close()
         cv.com_uninit()

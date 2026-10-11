@@ -1,7 +1,8 @@
-﻿PyQt5>=5.15
+PyQt5>=5.15
 PyMuPDF>=1.25.3
 Pillow>=10.0
 python-pptx>=1.0
 openpyxl>=3.1
 pywin32>=306
+imageio-ffmpeg>=0.5
 pyinstaller>=6.0

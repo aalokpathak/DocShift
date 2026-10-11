@@ -42,6 +42,7 @@ def main():
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
         "--name", "DocShift", "--icon", str(ICO),
         "--add-data", f"{SVG};assets",
+        "--collect-all", "imageio_ffmpeg",  # ships the ffmpeg binary used for video
         "--exclude-module", "tkinter", "--exclude-module", "unittest", "--exclude-module", "pydoc",
         "--exclude-module", "PyQt5.QtWebEngine", "--exclude-module", "PyQt5.QtNetwork",
         "--exclude-module", "PyQt5.QtQml", "--exclude-module", "PyQt5.QtQuick", "--exclude-module", "PyQt5.QtSql",

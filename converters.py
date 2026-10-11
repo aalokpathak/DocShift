@@ -7,12 +7,16 @@ Everything that starts from a PDF (or an image) is done with PyMuPDF / Pillow.
 """
 from __future__ import annotations
 
+import ctypes
+import gc
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +38,7 @@ KIND_EXTS = {
     "ppt": (".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".odp"),
     "img": (".jpg", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico"),
     "pdf": (".pdf",),
+    "video": (".mp4", ".mov", ".mkv", ".avi", ".webm", ".wmv", ".flv", ".m4v", ".mpg", ".mpeg", ".3gp"),
 }
 
 
@@ -53,25 +58,35 @@ class Mode:
     dst: str            # kind of output ("pdf", "word", ...)
     sub: str            # short hint under the title
     blurb: str          # longer description shown in the header
+    group: str = ""     # sidebar section: to / from / squeeze
 
 
 MODES = [
     Mode("word2pdf", "Word to PDF", "word", "pdf", "DOC, DOCX, RTF, TXT",
-         "Exported by Microsoft Word itself, so fonts, layout, tables, headers and images match the original."),
+         "Exported by Microsoft Word itself, so fonts, layout, tables, headers and images match the original.", "to"),
     Mode("excel2pdf", "Excel to PDF", "excel", "pdf", "XLS, XLSX, CSV",
-         "Exported by Microsoft Excel, with formatting, charts and borders intact. Wide sheets can be fitted to the page width."),
+         "Exported by Microsoft Excel, with formatting, charts and borders intact. Wide sheets can be fitted to the page width.", "to"),
     Mode("ppt2pdf", "PowerPoint to PDF", "ppt", "pdf", "PPT, PPTX, ODP",
-         "Exported by Microsoft PowerPoint, so every slide, font, shape and image matches."),
+         "Exported by Microsoft PowerPoint, so every slide, font, shape and image matches.", "to"),
     Mode("img2pdf", "Images to PDF", "img", "pdf", "JPG, PNG, WEBP & more",
-         "Turn one or many images into a PDF - one image per page - optionally merged into a single file."),
+         "Turn one or many images into a PDF - one image per page - optionally merged into a single file.", "to"),
     Mode("pdf2word", "PDF to Word", "pdf", "word", "Editable .docx",
-         "Converts the PDF into an editable Word document using Word's own PDF reflow engine."),
+         "Converts the PDF into an editable Word document using Word's own PDF reflow engine.", "from"),
     Mode("pdf2excel", "PDF to Excel", "pdf", "excel", "Tables to sheets",
-         "Detects tables in the PDF and places them in an Excel workbook, keeping other text alongside."),
+         "Detects tables in the PDF and places them in an Excel workbook, keeping other text alongside.", "from"),
     Mode("pdf2ppt", "PDF to PowerPoint", "pdf", "ppt", "One slide per page",
-         "Each PDF page becomes a slide - either pixel-exact, or with editable text on a clean background."),
+         "Each PDF page becomes a slide - either pixel-exact, or with editable text on a clean background.", "from"),
     Mode("pdf2img", "PDF to Images", "pdf", "img", "PNG, JPG, WEBP, TIFF",
-         "Renders pages to high-resolution images. Choose the format, resolution and which pages."),
+         "Renders pages to high-resolution images. Choose the format, resolution and which pages.", "from"),
+    Mode("compress_pdf", "Compress PDF", "pdf", "", "Shrink to a size limit",
+         "Make a PDF smaller for email or upload forms. Type a size in MB and DocShift keeps the best quality that fits.",
+         "squeeze"),
+    Mode("compress_img", "Compress Image", "img", "", "JPG, PNG, WEBP",
+         "Reduce image file size. Type a size in MB and DocShift finds the highest quality that stays under it.",
+         "squeeze"),
+    Mode("compress_video", "Compress Video", "video", "", "MP4, MOV, MKV & more",
+         "Re-encode a video to H.264 (MP4). Type a size in MB and DocShift picks the bitrate and resolution to fit.",
+         "squeeze"),
 ]
 MODE_BY_KEY = {m.key: m for m in MODES}
 
@@ -80,10 +95,30 @@ class ConversionError(Exception):
     """An error whose message is safe and helpful to show to the user."""
 
 
+class Cancelled(ConversionError):
+    """The user pressed Cancel while a long conversion was running."""
+
+
+class Control:
+    """Lets a long-running engine report progress (0..1) and notice a Cancel click."""
+
+    def __init__(self, progress=None, cancelled=None):
+        self._progress, self._cancelled = progress, cancelled
+
+    def report(self, fraction: float):
+        if self._progress:
+            self._progress(max(0.0, min(1.0, fraction)))
+
+    def check(self):
+        if self._cancelled and self._cancelled():
+            raise Cancelled("Cancelled")
+
+
 @dataclass
 class Result:
     outputs: list = field(default_factory=list)
     note: str = ""
+    detail: str = ""    # e.g. "12.4 MB -> 3.1 MB (-75%)", shown on the file row
 
     @property
     def reveal(self) -> Path | None:
@@ -172,26 +207,97 @@ def libreoffice_path() -> str | None:
     return next((c for c in cands if c and os.path.isfile(c)), None)
 
 
+def ffmpeg_path() -> str | None:
+    """The ffmpeg bundled by imageio-ffmpeg (shipped inside the exe), else one on PATH."""
+    try:
+        import imageio_ffmpeg
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        if p and os.path.isfile(p):
+            return p
+    except Exception:
+        pass
+    return shutil.which("ffmpeg")
+
+
 def engine_status() -> dict:
     """What can we convert with on this machine? Used for the status line in the UI."""
     have = {k: office_installed(k) for k in _PROGIDS}
     lo = libreoffice_path()
-    return {"office": have, "libreoffice": lo}
+    return {"office": have, "libreoffice": lo, "ffmpeg": ffmpeg_path()}
 
 
 MISSING = pythoncom.Missing if HAVE_COM else None
 
 
+_IMAGES = {"word": "WINWORD.EXE", "excel": "EXCEL.EXE", "ppt": "POWERPNT.EXE"}
+
+
+class _ProcessEntry(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p), ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def _pids(image: str) -> set[int]:
+    """Process IDs currently running `image` (e.g. EXCEL.EXE)."""
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.Process32FirstW.argtypes = k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcessEntry)]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return set()
+        found: set[int] = set()
+        entry = _ProcessEntry()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry)
+        try:
+            more = k32.Process32FirstW(snap, ctypes.byref(entry))
+            while more:
+                if entry.szExeFile.lower() == image.lower():
+                    found.add(entry.th32ProcessID)
+                more = k32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            k32.CloseHandle(snap)
+        return found
+    except Exception:
+        return set()
+
+
+def _wait_or_kill(pids: set[int], seconds: float):
+    """Give processes `seconds` to exit on their own, then terminate any that are still running."""
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    k32.TerminateProcess.argtypes = [ctypes.c_void_p, wintypes.UINT]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handles = [h for h in (k32.OpenProcess(0x100001, False, pid) for pid in pids) if h]  # SYNCHRONIZE | TERMINATE
+    deadline = time.monotonic() + seconds
+    for h in handles:
+        if k32.WaitForSingleObject(h, max(0, int((deadline - time.monotonic()) * 1000))) != 0:
+            k32.TerminateProcess(h, 1)
+        k32.CloseHandle(h)
+
+
 class OfficeSession:
-    """Starts one hidden Office instance per app on demand and reuses it for a whole batch."""
+    """Starts one hidden Office instance per app on demand and reuses it for a whole batch.
+
+    The process IDs of the instances it starts are remembered so that close() can make sure they are really gone:
+    on some Office builds Quit() returns but the process lingers, and a hidden Excel left running is a nasty surprise."""
 
     def __init__(self):
         self._apps: dict[str, object] = {}
+        self._pids: dict[str, set[int]] = {}
 
     def get(self, kind: str):
         app = self._apps.get(kind)
         if app is None:
+            before = _pids(_IMAGES[kind])
             app = self._apps[kind] = self._launch(kind)
+            self._pids[kind] = _pids(_IMAGES[kind]) - before  # DispatchEx always starts a fresh instance
         return app
 
     @staticmethod
@@ -228,12 +334,18 @@ class OfficeSession:
         return app
 
     def close(self):
-        for kind, app in list(self._apps.items()):
+        apps, pids = self._apps, self._pids
+        self._apps, self._pids = {}, {}
+        for kind, app in apps.items():
             try:
                 app.Quit(0) if kind == "word" else app.Quit()
             except Exception:
                 pass
-        self._apps.clear()
+        apps.clear()
+        del apps
+        gc.collect()  # drop our COM references so Office is free to exit
+        for kind, mine in pids.items():
+            _wait_or_kill(mine & _pids(_IMAGES[kind]), 2)  # only instances DocShift itself started
 
 
 def friendly_error(exc: BaseException) -> str:
@@ -370,7 +482,8 @@ def _libreoffice_to_pdf(soffice: str, src: Path, tmp: Path) -> Path:
            "--convert-to", "pdf", "--outdir", str(tmp), _abs(src)]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=300, creationflags=flags)
+        subprocess.run(cmd, check=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=300,
+                       creationflags=flags)
     except subprocess.TimeoutExpired:
         raise ConversionError("LibreOffice took too long to convert this file.")
     except subprocess.CalledProcessError as e:
@@ -932,9 +1045,11 @@ def _precheck(src: Path):
                                       "contents). Remove the password and try again.")
 
 
-def run(mode: str, sources: list[Path], out_dir: Path, opts: dict, office: OfficeSession) -> Result:
+def run(mode: str, sources: list[Path], out_dir: Path, opts: dict, office: OfficeSession,
+        ctl: Control | None = None) -> Result:
     """Convert `sources` (one file, or many for merged image->PDF) and return where the output went."""
     src = sources[0]
+    ctl = ctl or Control()
     if mode != "img2pdf":  # images are validated by Pillow, which reports per-file problems itself
         _precheck(src)
     elif not src.exists():
@@ -952,6 +1067,9 @@ def run(mode: str, sources: list[Path], out_dir: Path, opts: dict, office: Offic
             return pdf_to_pptx(src, out_dir, opts)
         if mode == "pdf2img":
             return pdf_to_images(src, out_dir, opts)
+        if mode.startswith("compress_"):
+            import compressors  # imported late: it depends on this module
+            return compressors.run(mode, src, out_dir, opts, ctl)
     except Exception:
         if HAVE_COM and mode in ("word2pdf", "excel2pdf", "ppt2pdf", "pdf2word"):
             # A crashed Office instance can't be reused for the next file; drop it so it restarts cleanly.
