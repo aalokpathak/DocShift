@@ -1,0 +1,204 @@
+@import "tailwindcss";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Tokens from the DocShift design (Claude Design mockup). Light is the base; [data-theme=dark] overrides. */
+:root {
+  --bg: #f5f6f8;
+  --chrome: #eceef2;
+  --side: #eef0f3;
+  --surface: #ffffff;
+  --seg-on: #ffffff;
+  --line: #dde0e6;
+  --card-line: #e2e5ea;
+  --btn-line: #d3d7de;
+  --strong-line: #c3c8d1;
+  --track: #e5e8ed;
+  --row-line: #eef0f3;
+  --s1: #f3f4f7;
+  --soft: #f9fafb;
+  --ink: #15171b;
+  --ink2: #3b4049;
+  --muted: #5d636e;
+  --faint: #848a95;
+  --sel: oklch(0.96 0.025 160);
+  --acc: oklch(0.52 0.12 160);
+  --acc2: oklch(0.62 0.12 160);
+  --acc-ink: oklch(0.45 0.12 160);
+  --danger: oklch(0.52 0.14 25);
+  --danger-soft: oklch(0.95 0.03 25);
+  --warn-ink: oklch(0.5 0.12 70);
+  --warn-soft: oklch(0.96 0.04 85);
+  /* file-type chip lightness / chroma (tint) and ink lightness */
+  --tl: 0.95;
+  --tc: 0.03;
+  --il: 0.45;
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --bg: #16181c;
+  --chrome: #1b1e23;
+  --side: #191b20;
+  --surface: #202329;
+  --seg-on: #3a3f48;
+  --line: #2a2e35;
+  --card-line: #2b2f37;
+  --btn-line: #3a3f48;
+  --strong-line: #4a505b;
+  --track: #2a2e35;
+  --row-line: #262930;
+  --s1: #262a30;
+  --soft: #1c1f24;
+  --ink: #eceef2;
+  --ink2: #c7cbd3;
+  --muted: #9ba1ac;
+  --faint: #7c828d;
+  --sel: oklch(0.3 0.045 160);
+  --acc: oklch(0.56 0.12 160);
+  --acc2: oklch(0.66 0.12 160);
+  --acc-ink: oklch(0.78 0.12 160);
+  --danger: oklch(0.62 0.15 25);
+  --danger-soft: oklch(0.3 0.06 25);
+  --warn-ink: oklch(0.82 0.12 80);
+  --warn-soft: oklch(0.3 0.05 80);
+  --tl: 0.31;
+  --tc: 0.06;
+  --il: 0.84;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --color-bg: var(--bg);
+  --color-chrome: var(--chrome);
+  --color-side: var(--side);
+  --color-surface: var(--surface);
+  --color-seg-on: var(--seg-on);
+  --color-line: var(--line);
+  --color-card-line: var(--card-line);
+  --color-btn-line: var(--btn-line);
+  --color-strong-line: var(--strong-line);
+  --color-track: var(--track);
+  --color-row-line: var(--row-line);
+  --color-s1: var(--s1);
+  --color-soft: var(--soft);
+  --color-ink: var(--ink);
+  --color-ink2: var(--ink2);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-sel: var(--sel);
+  --color-acc: var(--acc);
+  --color-acc2: var(--acc2);
+  --color-acc-ink: var(--acc-ink);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-warn-ink: var(--warn-ink);
+  --color-warn-soft: var(--warn-soft);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    overflow: hidden;
+    user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+  input,
+  textarea {
+    user-select: text;
+    font-family: inherit;
+  }
+  button {
+    font-family: inherit;
+  }
+  *:focus-visible {
+    outline: 2px solid var(--acc);
+    outline-offset: 2px;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--strong-line);
+    border-radius: 8px;
+    border: 3px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  /* small uppercase section label used throughout the design */
+  .eyebrow {
+    font: 500 10.5px var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--faint);
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--card-line);
+    border-radius: 12px;
+  }
+  .field {
+    width: 100%;
+    height: 36px;
+    background: var(--surface);
+    border: 1px solid var(--btn-line);
+    border-radius: 7px;
+    padding: 0 10px;
+    font-size: 13px;
+    color: var(--ink);
+  }
+  .field:focus {
+    outline: none;
+    border-color: var(--acc);
+  }
+  .field::placeholder {
+    color: var(--faint);
+  }
+  .stripes {
+    background: repeating-linear-gradient(135deg, var(--s1) 0 7px, var(--row-line) 7px 14px);
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.fade-up {
+  animation: fade-up 0.18s ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

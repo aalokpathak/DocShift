@@ -1,8 +1,18 @@
-.venv/
-venv/
-build/
+node_modules/
 dist/
-__pycache__/
-*.pyc
-*.spec
+release/
+
+# Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Native engines are downloaded by scripts/fetch-engines.ps1 (too large for git)
+src-tauri/binaries/*
+!src-tauri/binaries/PDFIUM-LICENSE.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
 .claude/
+*.log

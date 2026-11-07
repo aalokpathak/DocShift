@@ -1,0 +1,66 @@
+[package]
+name = "docshift"
+version = "2.0.0"
+description = "Convert, compress and edit PDFs, Office documents, images and video"
+authors = ["Alok Pathak"]
+edition = "2021"
+rust-version = "1.80"
+
+[lib]
+name = "docshift_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+zstd = "0.13"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+regex = "1"
+dirs = "6"
+rayon = "1"
+base64 = "0.22"
+zstd = "0.13"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+lopdf = { version = "0.36", default-features = false, features = ["rayon"] }
+png = "0.17"
+pdfium-render = { version = "0.8", features = ["thread_safe", "image"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif", "ico"] }
+jpeg-encoder = "0.6"
+webp = "0.3"
+color_quant = "1"
+kamadak-exif = "0.6"
+tiff = "0.11"
+rust_xlsxwriter = "0.79"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.61"
+features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Security",
+  "Foundation",
+  "Foundation_Collections",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
